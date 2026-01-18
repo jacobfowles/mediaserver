@@ -3,7 +3,7 @@ const http = require('http');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const mime = require('mime-types');
 
 const SSDP_ADDRESS = '239.255.255.250';
@@ -12,17 +12,65 @@ const SSDP_PORT = 1900;
 class DLNAServer {
   constructor(options = {}) {
     this.name = options.name || 'Media Server';
-    this.mediaDir = options.mediaDir || './media';
+    this.mediaDir = path.resolve(options.mediaDir || './media');
     this.httpPort = options.httpPort || 8200;
     this.webPort = options.webPort || 3000;
-    this.uuid = `uuid:${uuidv4()}`;
+    this.uuid = null;
     this.ssdpSocket = null;
     this.httpServer = null;
-    this.localIP = this.getLocalIP();
+    this.localIP = null;
+    this.announceInterval = null;
+    this.stopped = false;
+    this.updateId = 1;
+
+    // Load or create persistent UUID
+    this.loadUUID();
+  }
+
+  loadUUID() {
+    const uuidFile = path.join(this.mediaDir, '.server-uuid');
+    try {
+      if (fs.existsSync(uuidFile)) {
+        const stored = fs.readFileSync(uuidFile, 'utf8').trim();
+        // Validate UUID format
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stored)) {
+          this.uuid = `uuid:${stored}`;
+          return;
+        }
+      }
+    } catch {
+      // Ignore read errors
+    }
+
+    // Generate new UUID
+    const newUuid = crypto.randomUUID();
+    this.uuid = `uuid:${newUuid}`;
+
+    // Try to persist it
+    try {
+      fs.writeFileSync(uuidFile, newUuid, 'utf8');
+    } catch (err) {
+      console.warn('Could not persist DLNA UUID:', err.message);
+    }
   }
 
   getLocalIP() {
     const interfaces = os.networkInterfaces();
+
+    // Prefer ethernet/wifi over other interfaces
+    const preferred = ['eth0', 'eth1', 'en0', 'en1', 'wlan0', 'wlan1'];
+
+    for (const name of preferred) {
+      if (interfaces[name]) {
+        for (const iface of interfaces[name]) {
+          if (iface.family === 'IPv4' && !iface.internal) {
+            return iface.address;
+          }
+        }
+      }
+    }
+
+    // Fallback: any non-internal IPv4
     for (const name of Object.keys(interfaces)) {
       for (const iface of interfaces[name]) {
         if (iface.family === 'IPv4' && !iface.internal) {
@@ -30,59 +78,124 @@ class DLNAServer {
         }
       }
     }
+
     return '127.0.0.1';
   }
 
   async start() {
-    await this.startHTTPServer();
-    await this.startSSDP();
-    this.startPeriodicAnnounce();
+    this.stopped = false;
+    this.localIP = this.getLocalIP();
+
+    try {
+      await this.startHTTPServer();
+    } catch (err) {
+      console.error('Failed to start DLNA HTTP server:', err.message);
+      throw err;
+    }
+
+    try {
+      await this.startSSDP();
+      this.startPeriodicAnnounce();
+    } catch (err) {
+      console.warn('SSDP discovery disabled:', err.message);
+      console.warn('TVs may not auto-discover the server, but direct access still works.');
+      // Continue without SSDP - server is still usable
+    }
   }
 
   stop() {
+    this.stopped = true;
+
     if (this.announceInterval) {
       clearInterval(this.announceInterval);
+      this.announceInterval = null;
     }
+
+    // Send bye-bye notification before closing
     if (this.ssdpSocket) {
-      this.ssdpSocket.close();
+      try {
+        this.sendByebye();
+      } catch {
+        // Ignore errors during shutdown
+      }
+
+      setTimeout(() => {
+        if (this.ssdpSocket) {
+          try {
+            this.ssdpSocket.close();
+          } catch {
+            // Ignore
+          }
+          this.ssdpSocket = null;
+        }
+      }, 200);
     }
+
     if (this.httpServer) {
       this.httpServer.close();
+      this.httpServer = null;
     }
   }
 
   async startHTTPServer() {
     return new Promise((resolve, reject) => {
       this.httpServer = http.createServer((req, res) => {
+        // Set timeout for requests
+        req.setTimeout(30000);
+        res.setTimeout(300000); // 5 min for large file transfers
+
         this.handleHTTPRequest(req, res);
+      });
+
+      this.httpServer.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error(`Port ${this.httpPort} is already in use`));
+        } else {
+          reject(err);
+        }
       });
 
       this.httpServer.listen(this.httpPort, '0.0.0.0', () => {
         resolve();
       });
-
-      this.httpServer.on('error', reject);
     });
   }
 
   handleHTTPRequest(req, res) {
-    const url = req.url;
+    // Basic request logging
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      if (duration > 1000 || res.statusCode >= 400) {
+        console.log(`DLNA ${req.method} ${req.url} ${res.statusCode} ${duration}ms`);
+      }
+    });
 
-    if (url === '/description.xml') {
-      this.sendDeviceDescription(res);
-    } else if (url === '/ContentDirectory.xml') {
-      this.sendContentDirectoryDescription(res);
-    } else if (url === '/ConnectionManager.xml') {
-      this.sendConnectionManagerDescription(res);
-    } else if (url === '/control/ContentDirectory') {
-      this.handleContentDirectoryControl(req, res);
-    } else if (url === '/control/ConnectionManager') {
-      this.handleConnectionManagerControl(req, res);
-    } else if (url.startsWith('/media/')) {
-      this.serveMediaFile(url, req, res);
-    } else {
-      res.writeHead(404);
-      res.end('Not Found');
+    try {
+      const url = req.url.split('?')[0]; // Ignore query strings
+
+      if (url === '/description.xml') {
+        this.sendDeviceDescription(res);
+      } else if (url === '/ContentDirectory.xml') {
+        this.sendContentDirectoryDescription(res);
+      } else if (url === '/ConnectionManager.xml') {
+        this.sendConnectionManagerDescription(res);
+      } else if (url === '/control/ContentDirectory') {
+        this.handleContentDirectoryControl(req, res);
+      } else if (url === '/control/ConnectionManager') {
+        this.handleConnectionManagerControl(req, res);
+      } else if (url.startsWith('/media/')) {
+        this.serveMediaFile(url, req, res);
+      } else {
+        res.writeHead(404);
+        res.end('Not Found');
+      }
+    } catch (err) {
+      console.error('DLNA HTTP error:', err);
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end('Internal Server Error');
+      }
     }
   }
 
@@ -296,42 +409,84 @@ class DLNAServer {
 
   handleContentDirectoryControl(req, res) {
     let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      if (body.includes('Browse')) {
-        this.handleBrowse(body, res);
-      } else if (body.includes('GetSystemUpdateID')) {
-        this.handleGetSystemUpdateID(res);
-      } else {
-        res.writeHead(500);
-        res.end('Unknown action');
+    let bodySize = 0;
+    const maxSize = 64 * 1024; // 64KB max for SOAP requests
+
+    req.on('data', chunk => {
+      bodySize += chunk.length;
+      if (bodySize > maxSize) {
+        req.destroy();
+        return;
       }
+      body += chunk;
+    });
+
+    req.on('end', () => {
+      try {
+        if (body.includes('Browse')) {
+          this.handleBrowse(body, res);
+        } else if (body.includes('GetSystemUpdateID')) {
+          this.handleGetSystemUpdateID(res);
+        } else {
+          res.writeHead(500);
+          res.end('Unknown action');
+        }
+      } catch (err) {
+        console.error('ContentDirectory control error:', err);
+        res.writeHead(500);
+        res.end('Internal error');
+      }
+    });
+
+    req.on('error', () => {
+      // Request aborted, nothing to do
     });
   }
 
   handleConnectionManagerControl(req, res) {
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    let bodySize = 0;
+    const maxSize = 64 * 1024;
+
+    req.on('data', chunk => {
+      bodySize += chunk.length;
+      if (bodySize > maxSize) {
+        req.destroy();
+        return;
+      }
+      body += chunk;
+    });
+
     req.on('end', () => {
-      if (body.includes('GetProtocolInfo')) {
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+      try {
+        if (body.includes('GetProtocolInfo')) {
+          const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
     <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-      <Source>http-get:*:video/mp4:*,http-get:*:video/mpeg:*,http-get:*:video/x-matroska:*,http-get:*:video/avi:*,http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:image/jpeg:*,http-get:*:image/png:*</Source>
+      <Source>http-get:*:video/mp4:*,http-get:*:video/mpeg:*,http-get:*:video/x-matroska:*,http-get:*:video/avi:*,http-get:*:video/webm:*,http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:audio/flac:*,http-get:*:audio/wav:*,http-get:*:image/jpeg:*,http-get:*:image/png:*,http-get:*:image/gif:*</Source>
       <Sink></Sink>
     </u:GetProtocolInfoResponse>
   </s:Body>
 </s:Envelope>`;
-        res.writeHead(200, {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'Content-Length': Buffer.byteLength(xml)
-        });
-        res.end(xml);
-      } else {
+          res.writeHead(200, {
+            'Content-Type': 'text/xml; charset=utf-8',
+            'Content-Length': Buffer.byteLength(xml)
+          });
+          res.end(xml);
+        } else {
+          res.writeHead(500);
+          res.end('Unknown action');
+        }
+      } catch (err) {
+        console.error('ConnectionManager control error:', err);
         res.writeHead(500);
-        res.end('Unknown action');
+        res.end('Internal error');
       }
+    });
+
+    req.on('error', () => {
+      // Request aborted
     });
   }
 
@@ -350,7 +505,7 @@ class DLNAServer {
       <Result>${this.escapeXml(didl)}</Result>
       <NumberReturned>${items.length}</NumberReturned>
       <TotalMatches>${items.length}</TotalMatches>
-      <UpdateID>1</UpdateID>
+      <UpdateID>${this.updateId}</UpdateID>
     </u:BrowseResponse>
   </s:Body>
 </s:Envelope>`;
@@ -367,7 +522,7 @@ class DLNAServer {
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
     <u:GetSystemUpdateIDResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-      <Id>1</Id>
+      <Id>${this.updateId}</Id>
     </u:GetSystemUpdateIDResponse>
   </s:Body>
 </s:Envelope>`;
@@ -379,49 +534,116 @@ class DLNAServer {
     res.end(xml);
   }
 
+  // Safely decode object ID to path
+  decodeObjectId(objectId) {
+    if (objectId === '0') {
+      return '';
+    }
+
+    try {
+      const decoded = Buffer.from(objectId, 'base64').toString('utf8');
+
+      // Security: check for path traversal
+      if (decoded.includes('..') || decoded.startsWith('/') || decoded.includes('\0')) {
+        return null;
+      }
+
+      // Verify the path exists and is within media dir
+      const fullPath = path.join(this.mediaDir, decoded);
+      const resolved = path.resolve(fullPath);
+
+      if (!resolved.startsWith(this.mediaDir + path.sep) && resolved !== this.mediaDir) {
+        return null;
+      }
+
+      return decoded;
+    } catch {
+      return null;
+    }
+  }
+
   getMediaItems(objectId) {
     const items = [];
-    let dirPath = this.mediaDir;
 
-    if (objectId !== '0') {
-      // Decode the object ID to get the relative path
-      dirPath = path.join(this.mediaDir, Buffer.from(objectId, 'base64').toString('utf8'));
+    const relativePath = this.decodeObjectId(objectId);
+    if (relativePath === null) {
+      return items;
     }
+
+    const dirPath = relativePath ? path.join(this.mediaDir, relativePath) : this.mediaDir;
 
     if (!fs.existsSync(dirPath)) {
       return items;
     }
 
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    try {
+      const stat = fs.statSync(dirPath);
+      if (!stat.isDirectory()) {
+        return items;
+      }
+    } catch {
+      return items;
+    }
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      return items;
+    }
 
     for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-      const relativePath = path.relative(this.mediaDir, fullPath);
-      const id = Buffer.from(relativePath).toString('base64');
+      // Skip hidden files
+      if (entry.name.startsWith('.')) {
+        continue;
+      }
 
-      if (entry.isDirectory()) {
-        items.push({
-          id,
-          parentId: objectId,
-          title: entry.name,
-          type: 'container'
-        });
-      } else {
-        const mimeType = mime.lookup(entry.name) || 'application/octet-stream';
-        if (this.isMediaFile(mimeType)) {
-          const stat = fs.statSync(fullPath);
+      const fullPath = path.join(dirPath, entry.name);
+      const itemRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+
+      try {
+        // Skip symlinks
+        const lstat = fs.lstatSync(fullPath);
+        if (lstat.isSymbolicLink()) {
+          continue;
+        }
+
+        const id = Buffer.from(itemRelativePath).toString('base64');
+
+        if (entry.isDirectory()) {
           items.push({
             id,
             parentId: objectId,
             title: entry.name,
-            type: 'item',
-            mimeType,
-            size: stat.size,
-            path: relativePath
+            type: 'container'
           });
+        } else {
+          const mimeType = mime.lookup(entry.name) || 'application/octet-stream';
+          if (this.isMediaFile(mimeType)) {
+            items.push({
+              id,
+              parentId: objectId,
+              title: entry.name,
+              type: 'item',
+              mimeType,
+              size: lstat.size,
+              path: itemRelativePath
+            });
+          }
         }
+      } catch {
+        // Skip files we can't access
+        continue;
       }
     }
+
+    // Sort: folders first, then alphabetically
+    items.sort((a, b) => {
+      if (a.type !== b.type) {
+        return a.type === 'container' ? -1 : 1;
+      }
+      return a.title.localeCompare(b.title);
+    });
 
     return items;
   }
@@ -437,17 +659,19 @@ class DLNAServer {
 
     for (const item of items) {
       if (item.type === 'container') {
-        didl += `<container id="${item.id}" parentID="${parentId}" restricted="1">`;
+        didl += `<container id="${this.escapeXml(item.id)}" parentID="${this.escapeXml(parentId)}" restricted="1">`;
         didl += `<dc:title>${this.escapeXml(item.title)}</dc:title>`;
         didl += `<upnp:class>object.container.storageFolder</upnp:class>`;
         didl += `</container>`;
       } else {
         const upnpClass = this.getUpnpClass(item.mimeType);
-        didl += `<item id="${item.id}" parentID="${parentId}" restricted="1">`;
+        // Encode path components individually for proper URL encoding
+        const encodedPath = item.path.split('/').map(encodeURIComponent).join('/');
+        didl += `<item id="${this.escapeXml(item.id)}" parentID="${this.escapeXml(parentId)}" restricted="1">`;
         didl += `<dc:title>${this.escapeXml(item.title)}</dc:title>`;
         didl += `<upnp:class>${upnpClass}</upnp:class>`;
         didl += `<res protocolInfo="http-get:*:${item.mimeType}:*" size="${item.size}">`;
-        didl += `http://${this.localIP}:${this.httpPort}/media/${encodeURIComponent(item.path)}`;
+        didl += `http://${this.localIP}:${this.httpPort}/media/${encodedPath}`;
         didl += `</res>`;
         didl += `</item>`;
       }
@@ -465,23 +689,81 @@ class DLNAServer {
   }
 
   serveMediaFile(url, req, res) {
-    const filePath = path.join(this.mediaDir, decodeURIComponent(url.replace('/media/', '')));
+    // Decode URL path
+    let relativePath;
+    try {
+      relativePath = decodeURIComponent(url.replace('/media/', ''));
+    } catch {
+      res.writeHead(400);
+      res.end('Invalid URL');
+      return;
+    }
 
-    if (!fs.existsSync(filePath)) {
+    // Security checks
+    if (relativePath.includes('..') || relativePath.includes('\0') || relativePath.startsWith('/')) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+
+    const filePath = path.join(this.mediaDir, relativePath);
+    const resolved = path.resolve(filePath);
+
+    // Ensure within media directory
+    if (!resolved.startsWith(this.mediaDir + path.sep) && resolved !== this.mediaDir) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+
+    // Check file exists and is not a symlink
+    let stat;
+    try {
+      const lstat = fs.lstatSync(resolved);
+      if (lstat.isSymbolicLink()) {
+        res.writeHead(403);
+        res.end('Forbidden');
+        return;
+      }
+      stat = fs.statSync(resolved);
+      if (stat.isDirectory()) {
+        res.writeHead(400);
+        res.end('Cannot serve directory');
+        return;
+      }
+    } catch {
       res.writeHead(404);
       res.end('Not Found');
       return;
     }
 
-    const stat = fs.statSync(filePath);
     const mimeType = mime.lookup(filePath) || 'application/octet-stream';
     const range = req.headers.range;
 
     if (range) {
-      // Support range requests for video seeking
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+      // Parse and validate range request
+      const rangeMatch = range.match(/bytes=(\d*)-(\d*)/);
+      if (!rangeMatch) {
+        res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+        res.end('Invalid range');
+        return;
+      }
+
+      let start = rangeMatch[1] ? parseInt(rangeMatch[1], 10) : 0;
+      let end = rangeMatch[2] ? parseInt(rangeMatch[2], 10) : stat.size - 1;
+
+      // Validate range values
+      if (isNaN(start) || isNaN(end) || start < 0 || end < start || start >= stat.size) {
+        res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+        res.end('Range not satisfiable');
+        return;
+      }
+
+      // Clamp end to file size
+      if (end >= stat.size) {
+        end = stat.size - 1;
+      }
+
       const chunkSize = end - start + 1;
 
       res.writeHead(206, {
@@ -491,7 +773,21 @@ class DLNAServer {
         'Content-Type': mimeType
       });
 
-      fs.createReadStream(filePath, { start, end }).pipe(res);
+      const stream = fs.createReadStream(resolved, { start, end });
+
+      stream.on('error', (err) => {
+        console.error('Stream error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500);
+        }
+        res.end();
+      });
+
+      stream.pipe(res);
+
+      res.on('close', () => {
+        stream.destroy();
+      });
     } else {
       res.writeHead(200, {
         'Content-Length': stat.size,
@@ -499,7 +795,21 @@ class DLNAServer {
         'Accept-Ranges': 'bytes'
       });
 
-      fs.createReadStream(filePath).pipe(res);
+      const stream = fs.createReadStream(resolved);
+
+      stream.on('error', (err) => {
+        console.error('Stream error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500);
+        }
+        res.end();
+      });
+
+      stream.pipe(res);
+
+      res.on('close', () => {
+        stream.destroy();
+      });
     }
   }
 
@@ -508,18 +818,33 @@ class DLNAServer {
       this.ssdpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
       this.ssdpSocket.on('error', (err) => {
-        console.error('SSDP error:', err);
-        reject(err);
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error('SSDP port 1900 already in use (another DLNA server running?)'));
+        } else if (err.code === 'EACCES') {
+          reject(new Error('Permission denied for SSDP port 1900 (try running as root or use a different port)'));
+        } else {
+          reject(err);
+        }
       });
 
       this.ssdpSocket.on('message', (msg, rinfo) => {
-        this.handleSSDPMessage(msg, rinfo);
+        if (this.stopped) return;
+        try {
+          this.handleSSDPMessage(msg, rinfo);
+        } catch (err) {
+          console.error('SSDP message handling error:', err);
+        }
       });
 
       this.ssdpSocket.bind(SSDP_PORT, () => {
-        this.ssdpSocket.addMembership(SSDP_ADDRESS);
-        this.ssdpSocket.setMulticastTTL(4);
-        resolve();
+        try {
+          this.ssdpSocket.addMembership(SSDP_ADDRESS);
+          this.ssdpSocket.setMulticastTTL(4);
+          resolve();
+        } catch (err) {
+          this.ssdpSocket.close();
+          reject(err);
+        }
       });
     });
   }
@@ -531,51 +856,68 @@ class DLNAServer {
       // Check if searching for our device type
       if (message.includes('upnp:rootdevice') ||
           message.includes('ssdp:all') ||
-          message.includes('MediaServer')) {
+          message.includes('MediaServer') ||
+          message.includes('ContentDirectory')) {
+        // Random delay to prevent network flooding
         setTimeout(() => {
-          this.sendSSDPResponse(rinfo);
+          if (!this.stopped && this.ssdpSocket) {
+            this.sendSSDPResponse(rinfo);
+          }
         }, Math.random() * 100);
       }
     }
   }
 
   sendSSDPResponse(rinfo) {
+    if (!this.ssdpSocket || this.stopped) return;
+
     const response = [
       'HTTP/1.1 200 OK',
-      `CACHE-CONTROL: max-age=1800`,
+      'CACHE-CONTROL: max-age=1800',
       `DATE: ${new Date().toUTCString()}`,
-      `EXT:`,
+      'EXT:',
       `LOCATION: http://${this.localIP}:${this.httpPort}/description.xml`,
-      `SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0`,
-      `ST: upnp:rootdevice`,
+      'SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0',
+      'ST: upnp:rootdevice',
       `USN: ${this.uuid}::upnp:rootdevice`,
       '',
       ''
     ].join('\r\n');
 
     const buf = Buffer.from(response);
-    this.ssdpSocket.send(buf, 0, buf.length, rinfo.port, rinfo.address);
+
+    try {
+      this.ssdpSocket.send(buf, 0, buf.length, rinfo.port, rinfo.address);
+    } catch (err) {
+      // Socket might be closed, ignore
+    }
   }
 
   startPeriodicAnnounce() {
     // Announce presence immediately
     this.announcePresence();
 
-    // Then announce every 5 minutes
+    // Then announce every 5 minutes (less than half the max-age)
     this.announceInterval = setInterval(() => {
-      this.announcePresence();
+      if (!this.stopped) {
+        // Update local IP in case network changed
+        this.localIP = this.getLocalIP();
+        this.announcePresence();
+      }
     }, 5 * 60 * 1000);
   }
 
   announcePresence() {
+    if (!this.ssdpSocket || this.stopped) return;
+
     const notify = [
       'NOTIFY * HTTP/1.1',
       `HOST: ${SSDP_ADDRESS}:${SSDP_PORT}`,
-      `CACHE-CONTROL: max-age=1800`,
+      'CACHE-CONTROL: max-age=1800',
       `LOCATION: http://${this.localIP}:${this.httpPort}/description.xml`,
-      `NT: upnp:rootdevice`,
-      `NTS: ssdp:alive`,
-      `SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0`,
+      'NT: upnp:rootdevice',
+      'NTS: ssdp:alive',
+      'SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0',
       `USN: ${this.uuid}::upnp:rootdevice`,
       '',
       ''
@@ -583,17 +925,44 @@ class DLNAServer {
 
     const buf = Buffer.from(notify);
 
-    // Send a few times for reliability
+    // Send multiple times for reliability (UDP is unreliable)
     for (let i = 0; i < 3; i++) {
       setTimeout(() => {
-        if (this.ssdpSocket) {
-          this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
+        if (this.ssdpSocket && !this.stopped) {
+          try {
+            this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
+          } catch {
+            // Ignore send errors
+          }
         }
       }, i * 100);
     }
   }
 
+  sendByebye() {
+    if (!this.ssdpSocket) return;
+
+    const notify = [
+      'NOTIFY * HTTP/1.1',
+      `HOST: ${SSDP_ADDRESS}:${SSDP_PORT}`,
+      'NT: upnp:rootdevice',
+      'NTS: ssdp:byebye',
+      `USN: ${this.uuid}::upnp:rootdevice`,
+      '',
+      ''
+    ].join('\r\n');
+
+    const buf = Buffer.from(notify);
+
+    try {
+      this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
+    } catch {
+      // Ignore
+    }
+  }
+
   escapeXml(str) {
+    if (typeof str !== 'string') return '';
     return str
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')

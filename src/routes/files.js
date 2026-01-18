@@ -3,25 +3,97 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
+// Safely resolve and validate a path is within the media directory
+function safePath(mediaDir, relativePath) {
+  const resolved = path.resolve(mediaDir, relativePath || '');
+  const normalizedMediaDir = path.resolve(mediaDir);
+
+  // Ensure the resolved path starts with mediaDir + separator (or is exactly mediaDir)
+  if (resolved !== normalizedMediaDir && !resolved.startsWith(normalizedMediaDir + path.sep)) {
+    return null;
+  }
+
+  // Check for symlinks that might escape
+  try {
+    const realPath = fs.realpathSync(resolved);
+    const realMediaDir = fs.realpathSync(normalizedMediaDir);
+    if (realPath !== realMediaDir && !realPath.startsWith(realMediaDir + path.sep)) {
+      return null;
+    }
+  } catch {
+    // Path doesn't exist yet, that's okay for some operations
+    // But we still need to check the parent exists and is safe
+    const parentDir = path.dirname(resolved);
+    if (fs.existsSync(parentDir)) {
+      try {
+        const realParent = fs.realpathSync(parentDir);
+        const realMediaDir = fs.realpathSync(normalizedMediaDir);
+        if (realParent !== realMediaDir && !realParent.startsWith(realMediaDir + path.sep)) {
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  return resolved;
+}
+
+// Generate unique filename if file exists
+function uniqueFilename(dir, filename) {
+  let filePath = path.join(dir, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return filename;
+  }
+
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  let counter = 1;
+
+  while (fs.existsSync(filePath)) {
+    const newName = `${base} (${counter})${ext}`;
+    filePath = path.join(dir, newName);
+    counter++;
+
+    // Safety limit
+    if (counter > 1000) {
+      return `${base}_${Date.now()}${ext}`;
+    }
+  }
+
+  return path.basename(filePath);
+}
+
 module.exports = function(mediaDir) {
   const router = express.Router();
+  const normalizedMediaDir = path.resolve(mediaDir);
 
   // Configure multer for file uploads
   const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-      const uploadPath = req.body.path || '';
-      const fullPath = path.join(mediaDir, uploadPath);
-
-      // Ensure directory exists
-      if (!fs.existsSync(fullPath)) {
-        fs.mkdirSync(fullPath, { recursive: true });
-      }
-
-      cb(null, fullPath);
+      // Note: req.body may not be fully populated yet for multipart
+      // We'll use a temp location and move later, or parse path from fields
+      cb(null, normalizedMediaDir);
     },
     filename: (req, file, cb) => {
-      // Sanitize filename
-      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      // Sanitize filename - allow unicode but remove dangerous chars
+      let safeName = file.originalname
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') // Remove Windows-illegal chars
+        .replace(/^\.+/, '_') // Don't start with dots
+        .trim();
+
+      if (!safeName || safeName === '') {
+        safeName = 'unnamed_file';
+      }
+
+      // Truncate if too long
+      if (safeName.length > 200) {
+        const ext = path.extname(safeName);
+        safeName = safeName.substring(0, 200 - ext.length) + ext;
+      }
+
       cb(null, safeName);
     }
   });
@@ -29,7 +101,8 @@ module.exports = function(mediaDir) {
   const upload = multer({
     storage,
     limits: {
-      fileSize: 5 * 1024 * 1024 * 1024 // 5GB limit
+      fileSize: 5 * 1024 * 1024 * 1024, // 5GB limit
+      files: 50
     }
   });
 
@@ -37,10 +110,9 @@ module.exports = function(mediaDir) {
   router.get('/list', (req, res) => {
     try {
       const relativePath = req.query.path || '';
-      const fullPath = path.join(mediaDir, relativePath);
+      const fullPath = safePath(normalizedMediaDir, relativePath);
 
-      // Security: ensure we're within mediaDir
-      if (!fullPath.startsWith(mediaDir)) {
+      if (!fullPath) {
         return res.status(403).json({ error: 'Access denied' });
       }
 
@@ -48,19 +120,42 @@ module.exports = function(mediaDir) {
         return res.json({ items: [], path: relativePath });
       }
 
-      const entries = fs.readdirSync(fullPath, { withFileTypes: true });
-      const items = entries.map(entry => {
-        const itemPath = path.join(fullPath, entry.name);
-        const stat = fs.statSync(itemPath);
+      // Ensure it's a directory
+      const stat = fs.statSync(fullPath);
+      if (!stat.isDirectory()) {
+        return res.status(400).json({ error: 'Not a directory' });
+      }
 
-        return {
-          name: entry.name,
-          isDirectory: entry.isDirectory(),
-          size: entry.isDirectory() ? null : stat.size,
-          modified: stat.mtime,
-          path: path.join(relativePath, entry.name)
-        };
-      });
+      const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+      const items = [];
+
+      for (const entry of entries) {
+        // Skip hidden files
+        if (entry.name.startsWith('.')) {
+          continue;
+        }
+
+        const itemPath = path.join(fullPath, entry.name);
+
+        // Skip symlinks for security
+        try {
+          const itemStat = fs.lstatSync(itemPath);
+          if (itemStat.isSymbolicLink()) {
+            continue;
+          }
+
+          items.push({
+            name: entry.name,
+            isDirectory: entry.isDirectory(),
+            size: entry.isDirectory() ? null : itemStat.size,
+            modified: itemStat.mtime,
+            path: path.join(relativePath, entry.name)
+          });
+        } catch {
+          // Skip files we can't stat
+          continue;
+        }
+      }
 
       // Sort: folders first, then files, alphabetically
       items.sort((a, b) => {
@@ -72,7 +167,8 @@ module.exports = function(mediaDir) {
 
       res.json({ items, path: relativePath });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('List error:', err);
+      res.status(500).json({ error: 'Failed to list directory' });
     }
   });
 
@@ -81,14 +177,29 @@ module.exports = function(mediaDir) {
     try {
       const { path: relativePath, name } = req.body;
 
-      if (!name || name.includes('/') || name.includes('\\')) {
+      if (!name || typeof name !== 'string') {
         return res.status(400).json({ error: 'Invalid folder name' });
       }
 
-      const fullPath = path.join(mediaDir, relativePath || '', name);
+      // Sanitize folder name
+      const safeName = name
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+        .replace(/^\.+/, '_')
+        .trim();
 
-      // Security check
-      if (!fullPath.startsWith(mediaDir)) {
+      if (!safeName || safeName.length > 200) {
+        return res.status(400).json({ error: 'Invalid folder name' });
+      }
+
+      const parentPath = safePath(normalizedMediaDir, relativePath || '');
+      if (!parentPath) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const fullPath = path.join(parentPath, safeName);
+
+      // Verify the new path is still within bounds
+      if (!fullPath.startsWith(normalizedMediaDir + path.sep) && fullPath !== normalizedMediaDir) {
         return res.status(403).json({ error: 'Access denied' });
       }
 
@@ -97,23 +208,64 @@ module.exports = function(mediaDir) {
       }
 
       fs.mkdirSync(fullPath, { recursive: true });
-      res.json({ success: true, path: path.join(relativePath || '', name) });
+      res.json({ success: true, path: path.join(relativePath || '', safeName) });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Create folder error:', err);
+      res.status(500).json({ error: 'Failed to create folder' });
     }
   });
 
   // Upload files
   router.post('/upload', upload.array('files', 50), (req, res) => {
     try {
-      const uploaded = req.files.map(f => ({
-        name: f.filename,
-        size: f.size,
-        path: path.join(req.body.path || '', f.filename)
-      }));
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+
+      const destPath = req.body.path || '';
+      const destFullPath = safePath(normalizedMediaDir, destPath);
+
+      if (!destFullPath) {
+        // Clean up uploaded files
+        req.files.forEach(f => {
+          try { fs.unlinkSync(f.path); } catch {}
+        });
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      // Ensure destination exists
+      if (!fs.existsSync(destFullPath)) {
+        fs.mkdirSync(destFullPath, { recursive: true });
+      }
+
+      const uploaded = [];
+
+      for (const file of req.files) {
+        try {
+          const finalName = uniqueFilename(destFullPath, file.filename);
+          const finalPath = path.join(destFullPath, finalName);
+
+          // Move file if destination is different from temp location
+          if (file.path !== finalPath) {
+            fs.renameSync(file.path, finalPath);
+          }
+
+          uploaded.push({
+            name: finalName,
+            size: file.size,
+            path: path.join(destPath, finalName)
+          });
+        } catch (err) {
+          console.error('Error moving uploaded file:', err);
+          // Try to clean up
+          try { fs.unlinkSync(file.path); } catch {}
+        }
+      }
+
       res.json({ success: true, files: uploaded });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Upload error:', err);
+      res.status(500).json({ error: 'Upload failed' });
     }
   });
 
@@ -122,15 +274,33 @@ module.exports = function(mediaDir) {
     try {
       const { path: itemPath, newName } = req.body;
 
-      if (!newName || newName.includes('/') || newName.includes('\\')) {
+      if (!itemPath || typeof itemPath !== 'string') {
+        return res.status(400).json({ error: 'Invalid path' });
+      }
+
+      if (!newName || typeof newName !== 'string') {
         return res.status(400).json({ error: 'Invalid name' });
       }
 
-      const oldFullPath = path.join(mediaDir, itemPath);
-      const newFullPath = path.join(path.dirname(oldFullPath), newName);
+      // Sanitize new name
+      const safeName = newName
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+        .replace(/^\.+/, '_')
+        .trim();
 
-      // Security check
-      if (!oldFullPath.startsWith(mediaDir) || !newFullPath.startsWith(mediaDir)) {
+      if (!safeName || safeName.length > 200) {
+        return res.status(400).json({ error: 'Invalid name' });
+      }
+
+      const oldFullPath = safePath(normalizedMediaDir, itemPath);
+      if (!oldFullPath) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const newFullPath = path.join(path.dirname(oldFullPath), safeName);
+
+      // Verify new path is still within bounds
+      if (!newFullPath.startsWith(normalizedMediaDir + path.sep)) {
         return res.status(403).json({ error: 'Access denied' });
       }
 
@@ -138,14 +308,22 @@ module.exports = function(mediaDir) {
         return res.status(404).json({ error: 'Item not found' });
       }
 
+      // Check it's not a symlink
+      if (fs.lstatSync(oldFullPath).isSymbolicLink()) {
+        return res.status(403).json({ error: 'Cannot rename symlinks' });
+      }
+
       if (fs.existsSync(newFullPath)) {
         return res.status(400).json({ error: 'An item with that name already exists' });
       }
 
       fs.renameSync(oldFullPath, newFullPath);
-      res.json({ success: true, newPath: path.join(path.dirname(itemPath), newName) });
+
+      const relativePath = path.relative(normalizedMediaDir, newFullPath);
+      res.json({ success: true, newPath: relativePath });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Rename error:', err);
+      res.status(500).json({ error: 'Failed to rename' });
     }
   });
 
@@ -154,10 +332,12 @@ module.exports = function(mediaDir) {
     try {
       const { items, destination } = req.body;
 
-      const destFullPath = path.join(mediaDir, destination || '');
+      if (!Array.isArray(items)) {
+        return res.status(400).json({ error: 'Invalid items' });
+      }
 
-      // Security check
-      if (!destFullPath.startsWith(mediaDir)) {
+      const destFullPath = safePath(normalizedMediaDir, destination || '');
+      if (!destFullPath) {
         return res.status(403).json({ error: 'Access denied' });
       }
 
@@ -165,33 +345,135 @@ module.exports = function(mediaDir) {
         fs.mkdirSync(destFullPath, { recursive: true });
       }
 
-      const moved = [];
-      for (const itemPath of items) {
-        const srcFullPath = path.join(mediaDir, itemPath);
+      if (!fs.statSync(destFullPath).isDirectory()) {
+        return res.status(400).json({ error: 'Destination is not a directory' });
+      }
 
-        if (!srcFullPath.startsWith(mediaDir)) {
+      const moved = [];
+      const errors = [];
+
+      for (const itemPath of items) {
+        if (typeof itemPath !== 'string') continue;
+
+        const srcFullPath = safePath(normalizedMediaDir, itemPath);
+        if (!srcFullPath) {
+          errors.push({ path: itemPath, error: 'Access denied' });
           continue;
         }
 
         if (!fs.existsSync(srcFullPath)) {
+          errors.push({ path: itemPath, error: 'Not found' });
           continue;
         }
 
-        const itemName = path.basename(itemPath);
+        // Check it's not a symlink
+        if (fs.lstatSync(srcFullPath).isSymbolicLink()) {
+          errors.push({ path: itemPath, error: 'Cannot move symlinks' });
+          continue;
+        }
+
+        const itemName = path.basename(srcFullPath);
         const newFullPath = path.join(destFullPath, itemName);
 
         // Don't move into self
-        if (newFullPath.startsWith(srcFullPath + path.sep)) {
+        if (newFullPath === srcFullPath || newFullPath.startsWith(srcFullPath + path.sep)) {
+          errors.push({ path: itemPath, error: 'Cannot move into itself' });
           continue;
         }
 
-        fs.renameSync(srcFullPath, newFullPath);
-        moved.push({ from: itemPath, to: path.join(destination || '', itemName) });
+        try {
+          // Handle name collision
+          const finalName = uniqueFilename(destFullPath, itemName);
+          const finalPath = path.join(destFullPath, finalName);
+
+          fs.renameSync(srcFullPath, finalPath);
+          moved.push({
+            from: itemPath,
+            to: path.relative(normalizedMediaDir, finalPath)
+          });
+        } catch (err) {
+          errors.push({ path: itemPath, error: err.message });
+        }
       }
 
-      res.json({ success: true, moved });
+      res.json({ success: true, moved, errors: errors.length > 0 ? errors : undefined });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Move error:', err);
+      res.status(500).json({ error: 'Move failed' });
+    }
+  });
+
+  // Copy files/folders
+  router.post('/copy', (req, res) => {
+    try {
+      const { items, destination } = req.body;
+
+      if (!Array.isArray(items)) {
+        return res.status(400).json({ error: 'Invalid items' });
+      }
+
+      const destFullPath = safePath(normalizedMediaDir, destination || '');
+      if (!destFullPath) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      if (!fs.existsSync(destFullPath)) {
+        fs.mkdirSync(destFullPath, { recursive: true });
+      }
+
+      if (!fs.statSync(destFullPath).isDirectory()) {
+        return res.status(400).json({ error: 'Destination is not a directory' });
+      }
+
+      const copied = [];
+      const errors = [];
+
+      for (const itemPath of items) {
+        if (typeof itemPath !== 'string') continue;
+
+        const srcFullPath = safePath(normalizedMediaDir, itemPath);
+        if (!srcFullPath) {
+          errors.push({ path: itemPath, error: 'Access denied' });
+          continue;
+        }
+
+        if (!fs.existsSync(srcFullPath)) {
+          errors.push({ path: itemPath, error: 'Not found' });
+          continue;
+        }
+
+        // Check it's not a symlink
+        if (fs.lstatSync(srcFullPath).isSymbolicLink()) {
+          errors.push({ path: itemPath, error: 'Cannot copy symlinks' });
+          continue;
+        }
+
+        const itemName = path.basename(srcFullPath);
+
+        try {
+          const finalName = uniqueFilename(destFullPath, itemName);
+          const finalPath = path.join(destFullPath, finalName);
+
+          // Copy file or directory
+          if (fs.statSync(srcFullPath).isDirectory()) {
+            fs.cpSync(srcFullPath, finalPath, { recursive: true });
+          } else {
+            fs.copyFileSync(srcFullPath, finalPath);
+          }
+
+          copied.push({
+            from: itemPath,
+            to: path.relative(normalizedMediaDir, finalPath)
+          });
+        } catch (err) {
+          errors.push({ path: itemPath, error: err.message });
+        }
+      }
+
+      res.json({ success: true, copied, errors: errors.length > 0 ? errors : undefined });
+    } catch (err) {
+      console.error('Copy error:', err);
+      res.status(500).json({ error: 'Copy failed' });
     }
   });
 
@@ -200,31 +482,57 @@ module.exports = function(mediaDir) {
     try {
       const { items } = req.body;
 
-      const deleted = [];
-      for (const itemPath of items) {
-        const fullPath = path.join(mediaDir, itemPath);
+      if (!Array.isArray(items)) {
+        return res.status(400).json({ error: 'Invalid items' });
+      }
 
-        // Security check
-        if (!fullPath.startsWith(mediaDir) || fullPath === mediaDir) {
+      const deleted = [];
+      const errors = [];
+
+      for (const itemPath of items) {
+        if (typeof itemPath !== 'string') continue;
+
+        const fullPath = safePath(normalizedMediaDir, itemPath);
+        if (!fullPath) {
+          errors.push({ path: itemPath, error: 'Access denied' });
+          continue;
+        }
+
+        // Prevent deleting the media directory itself
+        if (fullPath === normalizedMediaDir) {
+          errors.push({ path: itemPath, error: 'Cannot delete root directory' });
           continue;
         }
 
         if (!fs.existsSync(fullPath)) {
+          // Already gone, consider it deleted
+          deleted.push(itemPath);
           continue;
         }
 
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          fs.rmSync(fullPath, { recursive: true });
-        } else {
-          fs.unlinkSync(fullPath);
+        // Check it's not a symlink
+        if (fs.lstatSync(fullPath).isSymbolicLink()) {
+          errors.push({ path: itemPath, error: 'Cannot delete symlinks' });
+          continue;
         }
-        deleted.push(itemPath);
+
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            fs.rmSync(fullPath, { recursive: true });
+          } else {
+            fs.unlinkSync(fullPath);
+          }
+          deleted.push(itemPath);
+        } catch (err) {
+          errors.push({ path: itemPath, error: err.message });
+        }
       }
 
-      res.json({ success: true, deleted });
+      res.json({ success: true, deleted, errors: errors.length > 0 ? errors : undefined });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Delete error:', err);
+      res.status(500).json({ error: 'Delete failed' });
     }
   });
 

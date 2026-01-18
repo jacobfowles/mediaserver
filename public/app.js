@@ -4,13 +4,10 @@ let files = [];
 let selectedItems = new Set();
 let clipboard = { items: [], operation: null };
 let history = { back: [], forward: [] };
+const MAX_HISTORY = 50; // Prevent memory growth
 
-// Elements
-const fileList = document.getElementById('file-list');
-const addressInput = document.getElementById('address');
-const statusText = document.getElementById('status-text');
-const selectionCount = document.getElementById('selection-count');
-const contextMenu = document.getElementById('context-menu');
+// Elements (cached for performance)
+let fileList, addressInput, statusText, selectionCount, contextMenu;
 
 // Icons
 const ICONS = {
@@ -21,10 +18,26 @@ const ICONS = {
   file: `<svg viewBox="0 0 48 48"><path fill="currentColor" d="M8 4h20l12 12v28H8V4z"/><path fill="rgba(255,255,255,0.3)" d="M28 4v12h12z"/></svg>`
 };
 
-// Initialize
-document.addEventListener('DOMContentLoaded', init);
+// Initialize when DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
 
 function init() {
+  // Cache DOM elements
+  fileList = document.getElementById('file-list');
+  addressInput = document.getElementById('address');
+  statusText = document.getElementById('status-text');
+  selectionCount = document.getElementById('selection-count');
+  contextMenu = document.getElementById('context-menu');
+
+  if (!fileList || !addressInput || !statusText || !selectionCount || !contextMenu) {
+    console.error('Required DOM elements not found');
+    return;
+  }
+
   loadFiles('');
   setupEventListeners();
 }
@@ -48,7 +61,7 @@ function setupEventListeners() {
 
   // Context menu
   contextMenu.addEventListener('click', handleContextMenuAction);
-  document.addEventListener('click', () => contextMenu.classList.remove('visible'));
+  document.addEventListener('click', hideContextMenu);
 
   // Keyboard
   document.addEventListener('keydown', handleKeyDown);
@@ -60,14 +73,30 @@ function setupEventListeners() {
   setupDialogs();
 }
 
+function hideContextMenu() {
+  if (contextMenu) {
+    contextMenu.classList.remove('visible');
+  }
+}
+
 async function loadFiles(path) {
   try {
     statusText.textContent = 'Loading...';
+
     const response = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
     const data = await response.json();
 
-    files = data.items;
-    currentPath = data.path;
+    if (data.error) {
+      throw new Error(data.error);
+    }
+
+    files = data.items || [];
+    currentPath = data.path || '';
     selectedItems.clear();
 
     renderFiles();
@@ -75,11 +104,17 @@ async function loadFiles(path) {
     statusText.textContent = `${files.length} item${files.length !== 1 ? 's' : ''}`;
   } catch (err) {
     statusText.textContent = 'Error loading files';
-    console.error(err);
+    console.error('Load error:', err);
+    // Show empty state on error
+    files = [];
+    renderFiles();
+    updateUI();
   }
 }
 
 function renderFiles() {
+  if (!fileList) return;
+
   if (files.length === 0) {
     fileList.innerHTML = `
       <div class="empty-state">
@@ -110,11 +145,11 @@ function renderFiles() {
 function getIconType(file) {
   if (file.isDirectory) return 'folder';
 
-  const ext = file.name.split('.').pop().toLowerCase();
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
 
-  const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v'];
-  const audioExts = ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'];
-  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'];
+  const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', 'mpeg', 'mpg'];
+  const audioExts = ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma', 'opus'];
+  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico'];
 
   if (videoExts.includes(ext)) return 'video';
   if (audioExts.includes(ext)) return 'audio';
@@ -125,25 +160,31 @@ function getIconType(file) {
 
 function updateUI() {
   // Address bar
-  addressInput.value = '/' + currentPath;
+  if (addressInput) {
+    addressInput.value = '/' + currentPath;
+  }
 
   // Navigation buttons
-  document.getElementById('btn-back').disabled = history.back.length === 0;
-  document.getElementById('btn-forward').disabled = history.forward.length === 0;
-  document.getElementById('btn-up').disabled = currentPath === '';
+  const backBtn = document.getElementById('btn-back');
+  const fwdBtn = document.getElementById('btn-forward');
+  const upBtn = document.getElementById('btn-up');
+  const delBtn = document.getElementById('btn-delete');
 
-  // Delete button
-  document.getElementById('btn-delete').disabled = selectedItems.size === 0;
+  if (backBtn) backBtn.disabled = history.back.length === 0;
+  if (fwdBtn) fwdBtn.disabled = history.forward.length === 0;
+  if (upBtn) upBtn.disabled = currentPath === '';
+  if (delBtn) delBtn.disabled = selectedItems.size === 0;
 
   // Selection count
-  if (selectedItems.size > 0) {
-    selectionCount.textContent = `${selectedItems.size} selected`;
-  } else {
-    selectionCount.textContent = '';
+  if (selectionCount) {
+    selectionCount.textContent = selectedItems.size > 0 ? `${selectedItems.size} selected` : '';
   }
 
   // Paste menu item
-  document.getElementById('menu-paste').classList.toggle('disabled', clipboard.items.length === 0);
+  const pasteItem = document.getElementById('menu-paste');
+  if (pasteItem) {
+    pasteItem.classList.toggle('disabled', clipboard.items.length === 0);
+  }
 }
 
 function handleFileListClick(e) {
@@ -175,9 +216,11 @@ function handleFileListClick(e) {
     const start = paths.indexOf(lastSelected);
     const end = paths.indexOf(path);
 
-    const [from, to] = start < end ? [start, end] : [end, start];
-    for (let i = from; i <= to; i++) {
-      selectedItems.add(paths[i]);
+    if (start !== -1 && end !== -1) {
+      const [from, to] = start < end ? [start, end] : [end, start];
+      for (let i = from; i <= to; i++) {
+        selectedItems.add(paths[i]);
+      }
     }
   } else {
     // Single selection
@@ -205,7 +248,11 @@ function handleFileListDblClick(e) {
 }
 
 function navigateTo(path) {
+  // Limit history size
   history.back.push(currentPath);
+  if (history.back.length > MAX_HISTORY) {
+    history.back.shift();
+  }
   history.forward = [];
   loadFiles(path);
 }
@@ -213,12 +260,18 @@ function navigateTo(path) {
 function goBack() {
   if (history.back.length === 0) return;
   history.forward.push(currentPath);
+  if (history.forward.length > MAX_HISTORY) {
+    history.forward.shift();
+  }
   loadFiles(history.back.pop());
 }
 
 function goForward() {
   if (history.forward.length === 0) return;
   history.back.push(currentPath);
+  if (history.back.length > MAX_HISTORY) {
+    history.back.shift();
+  }
   loadFiles(history.forward.pop());
 }
 
@@ -253,30 +306,35 @@ function handleContextMenu(e) {
   contextMenu.classList.add('visible');
 
   // Adjust position if menu goes off screen
-  const rect = contextMenu.getBoundingClientRect();
-  if (rect.right > window.innerWidth) {
-    contextMenu.style.left = `${window.innerWidth - rect.width - 8}px`;
-  }
-  if (rect.bottom > window.innerHeight) {
-    contextMenu.style.top = `${window.innerHeight - rect.height - 8}px`;
-  }
+  requestAnimationFrame(() => {
+    const rect = contextMenu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      contextMenu.style.left = `${window.innerWidth - rect.width - 8}px`;
+    }
+    if (rect.bottom > window.innerHeight) {
+      contextMenu.style.top = `${window.innerHeight - rect.height - 8}px`;
+    }
+  });
 }
 
 function handleContextMenuAction(e) {
   const action = e.target.dataset.action;
   if (!action) return;
 
-  contextMenu.classList.remove('visible');
+  e.stopPropagation();
+  hideContextMenu();
 
   switch (action) {
     case 'open':
       if (selectedItems.size === 1) {
         const path = Array.from(selectedItems)[0];
         const file = files.find(f => f.path === path);
-        if (file.isDirectory) {
-          navigateTo(path);
-        } else {
-          window.open(`/media/${encodeURIComponent(path)}`, '_blank');
+        if (file) {
+          if (file.isDirectory) {
+            navigateTo(path);
+          } else {
+            window.open(`/media/${encodeURIComponent(path)}`, '_blank');
+          }
         }
       }
       break;
@@ -306,9 +364,14 @@ function handleContextMenuAction(e) {
 async function handlePaste() {
   if (clipboard.items.length === 0) return;
 
+  const operation = clipboard.operation;
+  const endpoint = operation === 'copy' ? '/api/files/copy' : '/api/files/move';
+  const verb = operation === 'copy' ? 'Copying' : 'Moving';
+
   try {
-    statusText.textContent = 'Moving...';
-    const response = await fetch('/api/files/move', {
+    statusText.textContent = `${verb}...`;
+
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -318,21 +381,37 @@ async function handlePaste() {
     });
 
     const data = await response.json();
+
     if (data.success) {
-      clipboard = { items: [], operation: null };
+      // Clear clipboard for cut, keep for copy
+      if (operation === 'cut') {
+        clipboard = { items: [], operation: null };
+      }
       loadFiles(currentPath);
     } else {
-      alert('Error: ' + data.error);
+      showError(data.error || `${verb} failed`);
+      statusText.textContent = 'Error';
     }
   } catch (err) {
-    alert('Error moving files');
+    showError(`${verb} failed`);
     console.error(err);
+    statusText.textContent = 'Error';
   }
 }
 
 function handleKeyDown(e) {
+  // Ignore if typing in input
+  if (e.target.matches('input')) {
+    if (e.key === 'Escape') {
+      e.target.blur();
+      document.querySelectorAll('.dialog-overlay').forEach(d => d.classList.remove('visible'));
+    }
+    return;
+  }
+
   // Delete key
   if (e.key === 'Delete' && selectedItems.size > 0) {
+    e.preventDefault();
     showDeleteDialog();
   }
 
@@ -344,34 +423,66 @@ function handleKeyDown(e) {
     updateUI();
   }
 
+  // Ctrl+C - copy
+  if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selectedItems.size > 0) {
+    e.preventDefault();
+    clipboard = { items: Array.from(selectedItems), operation: 'copy' };
+    updateUI();
+  }
+
+  // Ctrl+X - cut
+  if ((e.ctrlKey || e.metaKey) && e.key === 'x' && selectedItems.size > 0) {
+    e.preventDefault();
+    clipboard = { items: Array.from(selectedItems), operation: 'cut' };
+    renderFiles();
+    updateUI();
+  }
+
+  // Ctrl+V - paste
+  if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboard.items.length > 0) {
+    e.preventDefault();
+    handlePaste();
+  }
+
   // F2 - rename
   if (e.key === 'F2' && selectedItems.size === 1) {
+    e.preventDefault();
     showRenameDialog();
+  }
+
+  // F5 - refresh
+  if (e.key === 'F5') {
+    e.preventDefault();
+    refresh();
   }
 
   // Enter - open
   if (e.key === 'Enter' && selectedItems.size === 1) {
+    e.preventDefault();
     const path = Array.from(selectedItems)[0];
     const file = files.find(f => f.path === path);
-    if (file.isDirectory) {
-      navigateTo(path);
-    } else {
-      window.open(`/media/${encodeURIComponent(path)}`, '_blank');
+    if (file) {
+      if (file.isDirectory) {
+        navigateTo(path);
+      } else {
+        window.open(`/media/${encodeURIComponent(path)}`, '_blank');
+      }
     }
   }
 
   // Backspace - go up
-  if (e.key === 'Backspace' && !e.target.matches('input')) {
+  if (e.key === 'Backspace') {
     e.preventDefault();
     goUp();
   }
 
-  // Escape - clear selection
+  // Escape - clear selection and close dialogs
   if (e.key === 'Escape') {
     selectedItems.clear();
     renderFiles();
     updateUI();
     document.querySelectorAll('.dialog-overlay').forEach(d => d.classList.remove('visible'));
+    hideContextMenu();
   }
 }
 
@@ -379,6 +490,8 @@ function handleKeyDown(e) {
 function setupDragDrop() {
   const container = document.querySelector('.file-list-container');
   const overlay = document.getElementById('drop-overlay');
+
+  if (!container || !overlay) return;
 
   ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(event => {
     container.addEventListener(event, e => {
@@ -397,19 +510,20 @@ function setupDragDrop() {
 }
 
 async function handleDrop(e) {
-  document.getElementById('drop-overlay').classList.remove('active');
+  const overlay = document.getElementById('drop-overlay');
+  if (overlay) overlay.classList.remove('active');
 
-  const files = e.dataTransfer.files;
-  if (files.length === 0) return;
+  const droppedFiles = e.dataTransfer.files;
+  if (droppedFiles.length === 0) return;
 
-  uploadFiles(files);
+  uploadFiles(droppedFiles);
 }
 
 async function handleFileSelect(e) {
-  const files = e.target.files;
-  if (files.length === 0) return;
+  const selectedFiles = e.target.files;
+  if (selectedFiles.length === 0) return;
 
-  uploadFiles(files);
+  uploadFiles(selectedFiles);
   e.target.value = ''; // Reset input
 }
 
@@ -418,8 +532,11 @@ async function uploadFiles(fileList) {
   const percent = document.getElementById('upload-percent');
   const bar = document.getElementById('upload-bar');
 
+  if (!progress || !percent || !bar) return;
+
   progress.classList.add('visible');
   bar.style.width = '0%';
+  percent.textContent = '0%';
 
   const formData = new FormData();
   formData.append('path', currentPath);
@@ -442,22 +559,35 @@ async function uploadFiles(fileList) {
     xhr.addEventListener('load', () => {
       progress.classList.remove('visible');
       if (xhr.status === 200) {
-        loadFiles(currentPath);
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (data.success) {
+            loadFiles(currentPath);
+          } else {
+            showError(data.error || 'Upload failed');
+          }
+        } catch {
+          showError('Upload failed');
+        }
       } else {
-        alert('Upload failed');
+        showError('Upload failed');
       }
     });
 
     xhr.addEventListener('error', () => {
       progress.classList.remove('visible');
-      alert('Upload failed');
+      showError('Upload failed - network error');
+    });
+
+    xhr.addEventListener('abort', () => {
+      progress.classList.remove('visible');
     });
 
     xhr.open('POST', '/api/files/upload');
     xhr.send(formData);
   } catch (err) {
     progress.classList.remove('visible');
-    alert('Upload failed');
+    showError('Upload failed');
     console.error(err);
   }
 }
@@ -465,28 +595,41 @@ async function uploadFiles(fileList) {
 // Dialogs
 function setupDialogs() {
   // Rename dialog
-  document.getElementById('rename-cancel').addEventListener('click', () => {
+  const renameCancel = document.getElementById('rename-cancel');
+  const renameConfirm = document.getElementById('rename-confirm');
+  const renameInput = document.getElementById('rename-input');
+
+  if (renameCancel) renameCancel.addEventListener('click', () => {
     document.getElementById('rename-dialog').classList.remove('visible');
   });
-  document.getElementById('rename-confirm').addEventListener('click', handleRename);
-  document.getElementById('rename-input').addEventListener('keydown', e => {
+  if (renameConfirm) renameConfirm.addEventListener('click', handleRename);
+  if (renameInput) renameInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') handleRename();
+    if (e.key === 'Escape') document.getElementById('rename-dialog').classList.remove('visible');
   });
 
   // New folder dialog
-  document.getElementById('folder-cancel').addEventListener('click', () => {
+  const folderCancel = document.getElementById('folder-cancel');
+  const folderConfirm = document.getElementById('folder-confirm');
+  const folderInput = document.getElementById('folder-input');
+
+  if (folderCancel) folderCancel.addEventListener('click', () => {
     document.getElementById('folder-dialog').classList.remove('visible');
   });
-  document.getElementById('folder-confirm').addEventListener('click', handleCreateFolder);
-  document.getElementById('folder-input').addEventListener('keydown', e => {
+  if (folderConfirm) folderConfirm.addEventListener('click', handleCreateFolder);
+  if (folderInput) folderInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') handleCreateFolder();
+    if (e.key === 'Escape') document.getElementById('folder-dialog').classList.remove('visible');
   });
 
   // Delete dialog
-  document.getElementById('delete-cancel').addEventListener('click', () => {
+  const deleteCancel = document.getElementById('delete-cancel');
+  const deleteConfirm = document.getElementById('delete-confirm');
+
+  if (deleteCancel) deleteCancel.addEventListener('click', () => {
     document.getElementById('delete-dialog').classList.remove('visible');
   });
-  document.getElementById('delete-confirm').addEventListener('click', handleDelete);
+  if (deleteConfirm) deleteConfirm.addEventListener('click', handleDelete);
 }
 
 function showRenameDialog() {
@@ -494,24 +637,40 @@ function showRenameDialog() {
 
   const path = Array.from(selectedItems)[0];
   const file = files.find(f => f.path === path);
+  if (!file) return;
 
   const input = document.getElementById('rename-input');
-  input.value = file.name;
+  const dialog = document.getElementById('rename-dialog');
 
-  document.getElementById('rename-dialog').classList.add('visible');
-  input.focus();
-  input.select();
+  if (input && dialog) {
+    input.value = file.name;
+    dialog.classList.add('visible');
+    input.focus();
+    // Select filename without extension for files
+    if (!file.isDirectory && file.name.includes('.')) {
+      const dotIndex = file.name.lastIndexOf('.');
+      input.setSelectionRange(0, dotIndex);
+    } else {
+      input.select();
+    }
+  }
 }
 
 async function handleRename() {
   const path = Array.from(selectedItems)[0];
-  const newName = document.getElementById('rename-input').value.trim();
+  const input = document.getElementById('rename-input');
+  const dialog = document.getElementById('rename-dialog');
 
+  if (!input || !dialog) return;
+
+  const newName = input.value.trim();
   if (!newName) return;
 
-  document.getElementById('rename-dialog').classList.remove('visible');
+  dialog.classList.remove('visible');
 
   try {
+    statusText.textContent = 'Renaming...';
+
     const response = await fetch('/api/files/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -519,34 +678,46 @@ async function handleRename() {
     });
 
     const data = await response.json();
+
     if (data.success) {
       loadFiles(currentPath);
     } else {
-      alert('Error: ' + data.error);
+      showError(data.error || 'Rename failed');
+      statusText.textContent = 'Error';
     }
   } catch (err) {
-    alert('Error renaming');
+    showError('Rename failed');
     console.error(err);
+    statusText.textContent = 'Error';
   }
 }
 
 function showNewFolderDialog() {
   const input = document.getElementById('folder-input');
-  input.value = 'New Folder';
+  const dialog = document.getElementById('folder-dialog');
 
-  document.getElementById('folder-dialog').classList.add('visible');
-  input.focus();
-  input.select();
+  if (input && dialog) {
+    input.value = 'New Folder';
+    dialog.classList.add('visible');
+    input.focus();
+    input.select();
+  }
 }
 
 async function handleCreateFolder() {
-  const name = document.getElementById('folder-input').value.trim();
+  const input = document.getElementById('folder-input');
+  const dialog = document.getElementById('folder-dialog');
 
+  if (!input || !dialog) return;
+
+  const name = input.value.trim();
   if (!name) return;
 
-  document.getElementById('folder-dialog').classList.remove('visible');
+  dialog.classList.remove('visible');
 
   try {
+    statusText.textContent = 'Creating folder...';
+
     const response = await fetch('/api/files/folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -554,34 +725,42 @@ async function handleCreateFolder() {
     });
 
     const data = await response.json();
+
     if (data.success) {
       loadFiles(currentPath);
     } else {
-      alert('Error: ' + data.error);
+      showError(data.error || 'Failed to create folder');
+      statusText.textContent = 'Error';
     }
   } catch (err) {
-    alert('Error creating folder');
+    showError('Failed to create folder');
     console.error(err);
+    statusText.textContent = 'Error';
   }
 }
 
 function showDeleteDialog() {
   if (selectedItems.size === 0) return;
 
-  const count = selectedItems.size;
-  document.getElementById('delete-message').textContent =
-    count === 1
+  const message = document.getElementById('delete-message');
+  const dialog = document.getElementById('delete-dialog');
+
+  if (message && dialog) {
+    const count = selectedItems.size;
+    message.textContent = count === 1
       ? 'Are you sure you want to delete this item?'
       : `Are you sure you want to delete ${count} items?`;
-
-  document.getElementById('delete-dialog').classList.add('visible');
+    dialog.classList.add('visible');
+  }
 }
 
 async function handleDelete() {
-  document.getElementById('delete-dialog').classList.remove('visible');
+  const dialog = document.getElementById('delete-dialog');
+  if (dialog) dialog.classList.remove('visible');
 
   try {
     statusText.textContent = 'Deleting...';
+
     const response = await fetch('/api/files/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -589,19 +768,28 @@ async function handleDelete() {
     });
 
     const data = await response.json();
+
     if (data.success) {
       selectedItems.clear();
       loadFiles(currentPath);
     } else {
-      alert('Error: ' + data.error);
+      showError(data.error || 'Delete failed');
+      statusText.textContent = 'Error';
     }
   } catch (err) {
-    alert('Error deleting');
+    showError('Delete failed');
     console.error(err);
+    statusText.textContent = 'Error';
   }
 }
 
+function showError(message) {
+  // Use a simple alert for now - could be replaced with a nicer notification
+  alert(message);
+}
+
 function escapeHtml(str) {
+  if (typeof str !== 'string') return '';
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
