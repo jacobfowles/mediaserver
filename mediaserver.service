@@ -1,0 +1,18 @@
+[Unit]
+Description=Lobby Media Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/mediaserver
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=MEDIA_DIR=/home/pi/media
+Environment=PORT=3000
+Environment=DLNA_PORT=8200
+
+[Install]
+WantedBy=multi-user.target

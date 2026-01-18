@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Media Server - File Manager</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="toolbar">
+      <div class="toolbar-left">
+        <button id="btn-back" class="toolbar-btn" title="Back" disabled>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M11 2L5 8l6 6V2z"/>
+          </svg>
+        </button>
+        <button id="btn-forward" class="toolbar-btn" title="Forward" disabled>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M5 2l6 6-6 6V2z"/>
+          </svg>
+        </button>
+        <button id="btn-up" class="toolbar-btn" title="Up" disabled>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M2 11l6-6 6 6H2z"/>
+          </svg>
+        </button>
+        <button id="btn-refresh" class="toolbar-btn" title="Refresh">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.1-3.3l-1.9.5a3.5 3.5 0 1 0 .8 2.3L13.5 8zm.5-5v3h-3"/>
+          </svg>
+        </button>
+      </div>
+      <div class="address-bar">
+        <span class="address-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M1 3h6l2 2h6v9H1V3zm1 2v7h12V6H8.5L6.5 4H2z"/>
+          </svg>
+        </span>
+        <input type="text" id="address" value="/" readonly>
+      </div>
+    </header>
+
+    <div class="actions-bar">
+      <button id="btn-new-folder" class="action-btn">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M1 3h6l2 2h6v9H1V3zm7 4v2H6v2h2v2h2v-2h2V9h-2V7H8z"/>
+        </svg>
+        New Folder
+      </button>
+      <label class="action-btn" id="btn-upload">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M7 9V14h2V9h3L8 4 4 9h3zm-5 5h12v2H2v-2z"/>
+        </svg>
+        Upload
+        <input type="file" id="file-input" multiple hidden>
+      </label>
+      <button id="btn-delete" class="action-btn danger" disabled>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M5 2V1h6v1h4v2H1V2h4zm1 4h2v8H6V6zm4 0h2v8h-2V6zM3 4v11h10V4H3z"/>
+        </svg>
+        Delete
+      </button>
+    </div>
+
+    <main class="file-list-container">
+      <div id="file-list" class="file-list">
+        <!-- Files will be rendered here -->
+      </div>
+      <div id="drop-overlay" class="drop-overlay">
+        <div class="drop-message">Drop files here to upload</div>
+      </div>
+    </main>
+
+    <footer class="status-bar">
+      <span id="status-text">Ready</span>
+      <span id="selection-count"></span>
+    </footer>
+  </div>
+
+  <!-- Context Menu -->
+  <div id="context-menu" class="context-menu">
+    <div class="menu-item" data-action="open">Open</div>
+    <div class="menu-item" data-action="rename">Rename</div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="cut">Cut</div>
+    <div class="menu-item" data-action="copy">Copy</div>
+    <div class="menu-item" data-action="paste" id="menu-paste">Paste</div>
+    <div class="menu-separator"></div>
+    <div class="menu-item danger" data-action="delete">Delete</div>
+  </div>
+
+  <!-- Rename Dialog -->
+  <div id="rename-dialog" class="dialog-overlay">
+    <div class="dialog">
+      <div class="dialog-title">Rename</div>
+      <input type="text" id="rename-input" class="dialog-input">
+      <div class="dialog-buttons">
+        <button class="dialog-btn" id="rename-cancel">Cancel</button>
+        <button class="dialog-btn primary" id="rename-confirm">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New Folder Dialog -->
+  <div id="folder-dialog" class="dialog-overlay">
+    <div class="dialog">
+      <div class="dialog-title">New Folder</div>
+      <input type="text" id="folder-input" class="dialog-input" placeholder="Folder name">
+      <div class="dialog-buttons">
+        <button class="dialog-btn" id="folder-cancel">Cancel</button>
+        <button class="dialog-btn primary" id="folder-confirm">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirmation Dialog -->
+  <div id="delete-dialog" class="dialog-overlay">
+    <div class="dialog">
+      <div class="dialog-title">Confirm Delete</div>
+      <p id="delete-message">Are you sure you want to delete the selected items?</p>
+      <div class="dialog-buttons">
+        <button class="dialog-btn" id="delete-cancel">Cancel</button>
+        <button class="dialog-btn danger" id="delete-confirm">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Upload Progress -->
+  <div id="upload-progress" class="upload-progress">
+    <div class="upload-progress-text">Uploading... <span id="upload-percent">0%</span></div>
+    <div class="upload-progress-bar">
+      <div id="upload-bar" class="upload-bar"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
