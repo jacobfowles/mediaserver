@@ -184,6 +184,16 @@ class DLNAServer {
         this.handleContentDirectoryControl(req, res);
       } else if (url === '/control/ConnectionManager') {
         this.handleConnectionManagerControl(req, res);
+      } else if (url === '/icon-120.png' || url === '/icon-48.png') {
+        const iconPath = path.join(__dirname, '..', '..', 'public', url.slice(1));
+        if (fs.existsSync(iconPath)) {
+          const data = fs.readFileSync(iconPath);
+          res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': data.length });
+          res.end(data);
+        } else {
+          res.writeHead(404);
+          res.end('Not Found');
+        }
       } else if (url.startsWith('/media/')) {
         this.serveMediaFile(url, req, res);
       } else {
@@ -213,6 +223,22 @@ class DLNAServer {
     <modelName>Simple DLNA Server</modelName>
     <modelNumber>1.0</modelNumber>
     <UDN>${this.uuid}</UDN>
+    <iconList>
+      <icon>
+        <mimetype>image/png</mimetype>
+        <width>120</width>
+        <height>120</height>
+        <depth>32</depth>
+        <url>/icon-120.png</url>
+      </icon>
+      <icon>
+        <mimetype>image/png</mimetype>
+        <width>48</width>
+        <height>48</height>
+        <depth>32</depth>
+        <url>/icon-48.png</url>
+      </icon>
+    </iconList>
     <serviceList>
       <service>
         <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
