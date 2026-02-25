@@ -38,6 +38,27 @@ app.disable('x-powered-by');
 // JSON body parser with size limit
 app.use(express.json({ limit: '1mb' }));
 
+// Basic auth for web interface (not DLNA)
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'velocitychurch1!';
+app.use((req, res, next) => {
+  // Skip auth for DLNA media serving and health check
+  if (req.url.startsWith('/media/') || req.url === '/api/health') {
+    return next();
+  }
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Basic ')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Media Server"');
+    return res.status(401).end('Unauthorized');
+  }
+  const decoded = Buffer.from(auth.slice(6), 'base64').toString();
+  const [, password] = decoded.split(':');
+  if (password !== ADMIN_PASSWORD) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Media Server"');
+    return res.status(401).end('Unauthorized');
+  }
+  next();
+});
+
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
