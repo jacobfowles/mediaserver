@@ -212,7 +212,7 @@ async function main() {
 
     // Start DLNA server
     dlnaServer = new DLNAServer({
-      name: 'Lobby Media Server',
+      name: 'Lobby TV Media Server',
       mediaDir: MEDIA_DIR,
       httpPort: DLNA_PORT,
       webPort: PORT

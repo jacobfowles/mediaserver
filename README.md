@@ -1,4 +1,4 @@
-# Lobby Media Server
+# Lobby TV Media Server
 
 A simple, lightweight DLNA media server with a web-based file manager. Designed to run on a Raspberry Pi and display media on TVs in a lobby or similar space.
 
@@ -44,7 +44,7 @@ Once started, you'll see:
   Media Directory: /path/to/mediaserver/media
 ========================================
   DLNA Server running on port 8200
-  Your TVs should discover: "Lobby Media Server"
+  Your TVs should discover: "Lobby TV Media Server"
 ========================================
 ```
 
@@ -61,7 +61,7 @@ Open `http://<raspberry-pi-ip>:3000` in a browser to access the file manager.
 
 ### DLNA
 
-Your TV or media player should automatically discover "Lobby Media Server". Browse to it to see your media files organized by folder.
+Your TV or media player should automatically discover "Lobby TV Media Server". Browse to it to see your media files organized by folder.
 
 ## Configuration
 

@@ -209,7 +209,7 @@ class DLNAServer {
   <device>
     <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
     <friendlyName>${this.escapeXml(this.name)}</friendlyName>
-    <manufacturer>Lobby Media Server</manufacturer>
+    <manufacturer>Lobby TV Media Server</manufacturer>
     <modelName>Simple DLNA Server</modelName>
     <modelNumber>1.0</modelNumber>
     <UDN>${this.uuid}</UDN>
