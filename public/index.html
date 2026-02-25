@@ -75,6 +75,7 @@
     <footer class="status-bar">
       <span id="status-text">Ready</span>
       <span id="selection-count"></span>
+      <a href="#" id="btn-logout" style="color:#888;text-decoration:none;font-size:12px;" title="Sign out">Logout</a>
     </footer>
   </div>
 
@@ -135,5 +136,12 @@
   </div>
 
   <script src="app.js"></script>
+  <script>
+    document.getElementById('btn-logout').addEventListener('click', async (e) => {
+      e.preventDefault();
+      await fetch('/api/logout', { method: 'POST' });
+      window.location.reload();
+    });
+  </script>
 </body>
 </html>

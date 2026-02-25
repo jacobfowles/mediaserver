@@ -1,6 +1,7 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const fileRoutes = require('./src/routes/files');
 const DLNAServer = require('./src/dlna/server');
 
@@ -38,25 +39,70 @@ app.disable('x-powered-by');
 // JSON body parser with size limit
 app.use(express.json({ limit: '1mb' }));
 
-// Basic auth for web interface (not DLNA)
+// Cookie-based auth for web interface (not DLNA)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'velocitychurch1!';
+const SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+const COOKIE_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function makeSessionToken() {
+  const expires = Date.now() + COOKIE_MAX_AGE;
+  const payload = `${expires}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function verifySessionToken(token) {
+  if (!token) return false;
+  const [payload, sig] = token.split('.');
+  if (!payload || !sig) return false;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
+  if (sig !== expected) return false;
+  const expires = parseInt(payload, 10);
+  return Date.now() < expires;
+}
+
+function parseCookies(header) {
+  const cookies = {};
+  if (!header) return cookies;
+  header.split(';').forEach(c => {
+    const [k, ...v] = c.trim().split('=');
+    if (k) cookies[k.trim()] = decodeURIComponent(v.join('='));
+  });
+  return cookies;
+}
+
+// Login endpoint
+app.post('/api/login', (req, res) => {
+  if (req.body && req.body.password === ADMIN_PASSWORD) {
+    const token = makeSessionToken();
+    res.setHeader('Set-Cookie', `session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE / 1000}`);
+    res.json({ ok: true });
+  } else {
+    res.status(401).json({ error: 'Incorrect password' });
+  }
+});
+
+// Logout endpoint
+app.post('/api/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  res.json({ ok: true });
+});
+
+// Auth middleware
 app.use((req, res, next) => {
-  // Skip auth for DLNA media serving and health check
-  if (req.url.startsWith('/media/') || req.url === '/api/health') {
+  // Skip auth for DLNA media serving, health check, and login page
+  if (req.url.startsWith('/media/') || req.url === '/api/health' || req.url === '/login.html') {
     return next();
   }
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Basic ')) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="Media Server"');
-    return res.status(401).end('Unauthorized');
+  const cookies = parseCookies(req.headers.cookie);
+  if (verifySessionToken(cookies.session)) {
+    return next();
   }
-  const decoded = Buffer.from(auth.slice(6), 'base64').toString();
-  const [, password] = decoded.split(':');
-  if (password !== ADMIN_PASSWORD) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="Media Server"');
-    return res.status(401).end('Unauthorized');
+  // Serve login page for browser requests, 401 for API
+  if (req.url.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
-  next();
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
 // Serve static files

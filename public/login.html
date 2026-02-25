@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Media Server - Login</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #f0f0f0;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .login-card {
+      background: #fff;
+      border-radius: 8px;
+      padding: 32px;
+      min-width: 340px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+      border: 1px solid #d0d0d0;
+    }
+    .login-icon {
+      text-align: center;
+      margin-bottom: 16px;
+      color: #666;
+    }
+    .login-icon svg { width: 48px; height: 48px; }
+    .login-title {
+      font-size: 18px;
+      font-weight: 600;
+      text-align: center;
+      margin-bottom: 4px;
+      color: #333;
+    }
+    .login-subtitle {
+      font-size: 13px;
+      text-align: center;
+      color: #888;
+      margin-bottom: 24px;
+    }
+    .login-input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #c0c0c0;
+      border-radius: 4px;
+      font-size: 14px;
+      font-family: inherit;
+      margin-bottom: 16px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .login-input:focus {
+      outline: none;
+      border-color: #0078d4;
+      box-shadow: 0 0 0 1px #0078d4;
+    }
+    .login-input.error {
+      border-color: #d32f2f;
+      box-shadow: 0 0 0 1px #d32f2f;
+    }
+    .login-btn {
+      width: 100%;
+      padding: 10px;
+      background: #0078d4;
+      border: 1px solid #0078d4;
+      color: #fff;
+      border-radius: 4px;
+      font-size: 14px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .login-btn:hover { background: #006cc1; }
+    .login-btn:active { background: #005a9e; }
+    .login-error {
+      font-size: 13px;
+      color: #d32f2f;
+      text-align: center;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .login-error.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-icon">
+      <svg viewBox="0 0 16 16" fill="currentColor">
+        <path d="M1 3h6l2 2h6v9H1V3zm1 2v7h12V6H8.5L6.5 4H2z"/>
+      </svg>
+    </div>
+    <div class="login-title">Media Server</div>
+    <div class="login-subtitle">Enter password to continue</div>
+    <form id="login-form">
+      <div class="login-error" id="login-error">Incorrect password</div>
+      <input type="password" class="login-input" id="password" placeholder="Password" autofocus>
+      <button type="submit" class="login-btn">Sign In</button>
+    </form>
+  </div>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pw = document.getElementById('password');
+      const err = document.getElementById('login-error');
+      err.classList.remove('visible');
+      pw.classList.remove('error');
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pw.value })
+        });
+        if (res.ok) {
+          window.location.href = '/';
+        } else {
+          pw.classList.add('error');
+          err.classList.add('visible');
+          pw.select();
+        }
+      } catch {
+        pw.classList.add('error');
+        err.textContent = 'Connection error';
+        err.classList.add('visible');
+      }
+    });
+  </script>
+</body>
+</html>
