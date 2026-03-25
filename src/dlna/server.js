@@ -699,7 +699,7 @@ class DLNAServer {
         didl += `<item id="${this.escapeXml(item.id)}" parentID="${this.escapeXml(parentId)}" restricted="1">`;
         didl += `<dc:title>${this.escapeXml(item.title)}</dc:title>`;
         didl += `<upnp:class>${upnpClass}</upnp:class>`;
-        didl += `<res protocolInfo="http-get:*:${item.mimeType}:*" size="${item.size}">`;
+        didl += `<res protocolInfo="${this.getDlnaProtocolInfo(item.mimeType)}" size="${item.size}">`;
         didl += `http://${this.localIP}:${this.httpPort}/media/${encodedPath}`;
         didl += `</res>`;
         didl += `</item>`;
@@ -715,6 +715,34 @@ class DLNAServer {
     if (mimeType.startsWith('audio/')) return 'object.item.audioItem.musicTrack';
     if (mimeType.startsWith('image/')) return 'object.item.imageItem.photo';
     return 'object.item';
+  }
+
+  getDlnaProfile(mimeType) {
+    const profiles = {
+      'image/jpeg': 'JPEG_LRG',
+      'image/png': 'PNG_LRG',
+      'image/gif': 'GIF_LRG',
+      'video/mp4': 'AVC_MP4_MP_SD_AAC_MULT5',
+      'video/mpeg': 'MPEG_PS_NTSC',
+      'video/x-matroska': 'AVC_MKV_MP_HD_AAC_MULT5',
+      'video/avi': 'AVI',
+      'audio/mpeg': 'MP3',
+      'audio/mp4': 'AAC_ISO_320',
+      'audio/flac': 'FLAC',
+      'audio/wav': 'WAV',
+    };
+    return profiles[mimeType] || null;
+  }
+
+  getDlnaContentFeatures(mimeType) {
+    const profile = this.getDlnaProfile(mimeType);
+    const pn = profile ? `DLNA.ORG_PN=${profile};` : '';
+    return `${pn}DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000`;
+  }
+
+  getDlnaProtocolInfo(mimeType) {
+    const features = this.getDlnaContentFeatures(mimeType);
+    return `http-get:*:${mimeType}:${features}`;
   }
 
   serveMediaFile(url, req, res) {
@@ -767,6 +795,8 @@ class DLNAServer {
     }
 
     const mimeType = mime.lookup(filePath) || 'application/octet-stream';
+    const dlnaFeatures = this.getDlnaContentFeatures(mimeType);
+    const transferMode = mimeType.startsWith('image/') ? 'Interactive' : 'Streaming';
     const range = req.headers.range;
 
     if (range) {
@@ -799,7 +829,9 @@ class DLNAServer {
         'Content-Range': `bytes ${start}-${end}/${stat.size}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': chunkSize,
-        'Content-Type': mimeType
+        'Content-Type': mimeType,
+        'contentFeatures.dlna.org': dlnaFeatures,
+        'transferMode.dlna.org': transferMode
       });
 
       const stream = fs.createReadStream(resolved, { start, end });
@@ -821,7 +853,9 @@ class DLNAServer {
       res.writeHead(200, {
         'Content-Length': stat.size,
         'Content-Type': mimeType,
-        'Accept-Ranges': 'bytes'
+        'Accept-Ranges': 'bytes',
+        'contentFeatures.dlna.org': dlnaFeatures,
+        'transferMode.dlna.org': transferMode
       });
 
       const stream = fs.createReadStream(resolved);
