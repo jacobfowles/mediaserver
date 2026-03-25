@@ -8,6 +8,9 @@ const mime = require('mime-types');
 
 const SSDP_ADDRESS = '239.255.255.250';
 const SSDP_PORT = 1900;
+const DEVICE_TYPE = 'urn:schemas-upnp-org:device:MediaServer:1';
+const CONTENT_DIRECTORY = 'urn:schemas-upnp-org:service:ContentDirectory:1';
+const CONNECTION_MANAGER = 'urn:schemas-upnp-org:service:ConnectionManager:1';
 
 class DLNAServer {
   constructor(options = {}) {
@@ -875,42 +878,94 @@ class DLNAServer {
     });
   }
 
+  getNotificationTargets() {
+    return [
+      'upnp:rootdevice',
+      this.uuid,
+      DEVICE_TYPE,
+      CONTENT_DIRECTORY,
+      CONNECTION_MANAGER,
+    ];
+  }
+
+  getUSN(target) {
+    return target === this.uuid ? this.uuid : `${this.uuid}::${target}`;
+  }
+
+  buildNotifyMessage(nt, nts) {
+    const headers = [
+      'NOTIFY * HTTP/1.1',
+      `HOST: ${SSDP_ADDRESS}:${SSDP_PORT}`,
+    ];
+
+    if (nts === 'ssdp:alive') {
+      headers.push(
+        'CACHE-CONTROL: max-age=1800',
+        `LOCATION: http://${this.localIP}:${this.httpPort}/description.xml`,
+      );
+    }
+
+    headers.push(
+      `NT: ${nt}`,
+      `NTS: ${nts}`,
+    );
+
+    if (nts === 'ssdp:alive') {
+      headers.push('SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0');
+    }
+
+    headers.push(`USN: ${this.getUSN(nt)}`, '', '');
+    return Buffer.from(headers.join('\r\n'));
+  }
+
+  sendMulticast(buf) {
+    try {
+      this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
+    } catch {
+      // Ignore send errors
+    }
+  }
+
   handleSSDPMessage(msg, rinfo) {
     const message = msg.toString();
 
     if (message.includes('M-SEARCH') && message.includes('ssdp:discover')) {
-      // Check if searching for our device type
-      if (message.includes('upnp:rootdevice') ||
-          message.includes('ssdp:all') ||
-          message.includes('MediaServer') ||
-          message.includes('ContentDirectory')) {
-        // Random delay to prevent network flooding
-        setTimeout(() => {
-          if (!this.stopped && this.ssdpSocket) {
-            this.sendSSDPResponse(rinfo);
-          }
-        }, Math.random() * 100);
+      const stMatch = message.match(/ST:\s*(.+?)\r?\n/i);
+      const st = stMatch ? stMatch[1].trim() : '';
+
+      const targets = this.getNotificationTargets();
+      const respondTargets = st === 'ssdp:all'
+        ? targets
+        : targets.includes(st) ? [st] : [];
+
+      if (respondTargets.length > 0) {
+        const baseDelay = Math.random() * 100;
+        respondTargets.forEach((target, i) => {
+          setTimeout(() => {
+            if (!this.stopped && this.ssdpSocket) {
+              this.sendSSDPResponse(rinfo, target);
+            }
+          }, baseDelay + i * 50);
+        });
       }
     }
   }
 
-  sendSSDPResponse(rinfo) {
+  sendSSDPResponse(rinfo, st) {
     if (!this.ssdpSocket || this.stopped) return;
 
-    const response = [
+    const buf = Buffer.from([
       'HTTP/1.1 200 OK',
       'CACHE-CONTROL: max-age=1800',
       `DATE: ${new Date().toUTCString()}`,
       'EXT:',
       `LOCATION: http://${this.localIP}:${this.httpPort}/description.xml`,
       'SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0',
-      'ST: upnp:rootdevice',
-      `USN: ${this.uuid}::upnp:rootdevice`,
+      `ST: ${st}`,
+      `USN: ${this.getUSN(st)}`,
       '',
       ''
-    ].join('\r\n');
-
-    const buf = Buffer.from(response);
+    ].join('\r\n'));
 
     try {
       this.ssdpSocket.send(buf, 0, buf.length, rinfo.port, rinfo.address);
@@ -920,13 +975,10 @@ class DLNAServer {
   }
 
   startPeriodicAnnounce() {
-    // Announce presence immediately
     this.announcePresence();
 
-    // Then announce every 5 minutes (less than half the max-age)
     this.announceInterval = setInterval(() => {
       if (!this.stopped) {
-        // Update local IP in case network changed
         this.localIP = this.getLocalIP();
         this.announcePresence();
       }
@@ -936,29 +988,13 @@ class DLNAServer {
   announcePresence() {
     if (!this.ssdpSocket || this.stopped) return;
 
-    const notify = [
-      'NOTIFY * HTTP/1.1',
-      `HOST: ${SSDP_ADDRESS}:${SSDP_PORT}`,
-      'CACHE-CONTROL: max-age=1800',
-      `LOCATION: http://${this.localIP}:${this.httpPort}/description.xml`,
-      'NT: upnp:rootdevice',
-      'NTS: ssdp:alive',
-      'SERVER: Linux/1.0 UPnP/1.0 MediaServer/1.0',
-      `USN: ${this.uuid}::upnp:rootdevice`,
-      '',
-      ''
-    ].join('\r\n');
+    const buffers = this.getNotificationTargets().map(nt => this.buildNotifyMessage(nt, 'ssdp:alive'));
 
-    const buf = Buffer.from(notify);
-
-    // Send multiple times for reliability (UDP is unreliable)
     for (let i = 0; i < 3; i++) {
       setTimeout(() => {
         if (this.ssdpSocket && !this.stopped) {
-          try {
-            this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
-          } catch {
-            // Ignore send errors
+          for (const buf of buffers) {
+            this.sendMulticast(buf);
           }
         }
       }, i * 100);
@@ -968,22 +1004,8 @@ class DLNAServer {
   sendByebye() {
     if (!this.ssdpSocket) return;
 
-    const notify = [
-      'NOTIFY * HTTP/1.1',
-      `HOST: ${SSDP_ADDRESS}:${SSDP_PORT}`,
-      'NT: upnp:rootdevice',
-      'NTS: ssdp:byebye',
-      `USN: ${this.uuid}::upnp:rootdevice`,
-      '',
-      ''
-    ].join('\r\n');
-
-    const buf = Buffer.from(notify);
-
-    try {
-      this.ssdpSocket.send(buf, 0, buf.length, SSDP_PORT, SSDP_ADDRESS);
-    } catch {
-      // Ignore
+    for (const nt of this.getNotificationTargets()) {
+      this.sendMulticast(this.buildNotifyMessage(nt, 'ssdp:byebye'));
     }
   }
 
