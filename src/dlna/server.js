@@ -23,6 +23,7 @@ class DLNAServer {
     this.httpServer = null;
     this.localIP = null;
     this.announceInterval = null;
+    this.ssdpRetryTimer = null;
     this.stopped = false;
     this.updateId = 1;
 
@@ -73,7 +74,22 @@ class DLNAServer {
       }
     }
 
-    // Fallback: any non-internal IPv4
+    // Virtual interfaces (container bridges, VPN tunnels) carry IPs the LAN
+    // can't reach — advertising one in the SSDP LOCATION header breaks discovery.
+    const virtualPrefixes = ['docker', 'br-', 'veth', 'tailscale', 'virbr', 'tun', 'tap', 'wg', 'vmnet', 'zt'];
+    const isVirtual = (name) => virtualPrefixes.some(p => name.startsWith(p));
+
+    // Fallback: any non-internal IPv4 on a physical interface
+    for (const name of Object.keys(interfaces)) {
+      if (isVirtual(name)) continue;
+      for (const iface of interfaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          return iface.address;
+        }
+      }
+    }
+
+    // Last resort: any non-internal IPv4, even virtual
     for (const name of Object.keys(interfaces)) {
       for (const iface of interfaces[name]) {
         if (iface.family === 'IPv4' && !iface.internal) {
@@ -96,13 +112,33 @@ class DLNAServer {
       throw err;
     }
 
+    await this.tryStartSSDP(0);
+  }
+
+  async tryStartSSDP(attempt) {
+    if (this.stopped) return;
+
+    // Backoff schedule (seconds). After the last entry, give up.
+    const retryDelays = [30, 60, 120, 300];
+
     try {
       await this.startSSDP();
       this.startPeriodicAnnounce();
+      if (attempt > 0) {
+        console.log(`SSDP discovery started after ${attempt + 1} attempts`);
+      }
     } catch (err) {
-      console.warn('SSDP discovery disabled:', err.message);
-      console.warn('TVs may not auto-discover the server, but direct access still works.');
-      // Continue without SSDP - server is still usable
+      const next = retryDelays[attempt];
+      if (next !== undefined && !this.stopped) {
+        console.warn(`SSDP discovery failed (${err.message}); retrying in ${next}s`);
+        this.ssdpRetryTimer = setTimeout(() => {
+          this.ssdpRetryTimer = null;
+          this.tryStartSSDP(attempt + 1);
+        }, next * 1000);
+      } else {
+        console.warn(`SSDP discovery disabled after ${attempt + 1} attempts: ${err.message}`);
+        console.warn('TVs may not auto-discover the server, but direct access still works.');
+      }
     }
   }
 
@@ -112,6 +148,11 @@ class DLNAServer {
     if (this.announceInterval) {
       clearInterval(this.announceInterval);
       this.announceInterval = null;
+    }
+
+    if (this.ssdpRetryTimer) {
+      clearTimeout(this.ssdpRetryTimer);
+      this.ssdpRetryTimer = null;
     }
 
     // Send bye-bye notification before closing
@@ -877,20 +918,35 @@ class DLNAServer {
   }
 
   async startSSDP() {
-    return new Promise((resolve, reject) => {
-      this.ssdpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    // Clear any stale socket from a previous failed attempt
+    if (this.ssdpSocket) {
+      try { this.ssdpSocket.close(); } catch { /* ignore */ }
+      this.ssdpSocket = null;
+    }
 
-      this.ssdpSocket.on('error', (err) => {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+      this.ssdpSocket = sock;
+
+      const failed = (err) => {
+        if (this.ssdpSocket === sock) {
+          try { sock.close(); } catch { /* ignore */ }
+          this.ssdpSocket = null;
+        }
+        reject(err);
+      };
+
+      sock.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
-          reject(new Error('SSDP port 1900 already in use (another DLNA server running?)'));
+          failed(new Error('SSDP port 1900 already in use (another DLNA server running?)'));
         } else if (err.code === 'EACCES') {
-          reject(new Error('Permission denied for SSDP port 1900 (try running as root or use a different port)'));
+          failed(new Error('Permission denied for SSDP port 1900 (try running as root or use a different port)'));
         } else {
-          reject(err);
+          failed(err);
         }
       });
 
-      this.ssdpSocket.on('message', (msg, rinfo) => {
+      sock.on('message', (msg, rinfo) => {
         if (this.stopped) return;
         try {
           this.handleSSDPMessage(msg, rinfo);
@@ -899,14 +955,13 @@ class DLNAServer {
         }
       });
 
-      this.ssdpSocket.bind(SSDP_PORT, () => {
+      sock.bind(SSDP_PORT, () => {
         try {
-          this.ssdpSocket.addMembership(SSDP_ADDRESS);
-          this.ssdpSocket.setMulticastTTL(4);
+          sock.addMembership(SSDP_ADDRESS);
+          sock.setMulticastTTL(4);
           resolve();
         } catch (err) {
-          this.ssdpSocket.close();
-          reject(err);
+          failed(err);
         }
       });
     });
